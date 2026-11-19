@@ -319,16 +319,21 @@ def add_features(df, asset):
     return df
 
 
-def predict(asset, model_name):
+def predict(asset, model_name, prices=None):
     meta = get_asset(asset)
     cfg = meta["config"]
     cols, lookback = cfg["feature_columns"], int(cfg["lookback"])
 
-    prices = fetch_prices(asset)
+    custom = prices is not None
+    if not custom:
+        prices = fetch_prices(asset)
     feats = add_features(prices, asset).replace([np.inf, -np.inf], np.nan)
     feats = feats.dropna(subset=cols).reset_index(drop=True)
     if len(feats) < lookback:
-        raise RuntimeError(f"Not enough price history for {asset} ({len(feats)} rows).")
+        raise RuntimeError(
+            f"Not enough price history for {asset}: after warm-up only {len(feats)} usable rows, "
+            f"need at least {lookback}. Paste roughly {lookback + 70}+ daily rows."
+        )
 
     window = feats[cols].values[-lookback:]
     x = ((window - meta["f_mean"]) / meta["f_scale"]).astype(np.float32)[None]
@@ -350,24 +355,44 @@ def predict(asset, model_name):
         "direction": "UP" if ret > 0 else "DOWN",
         "all_models_pct": {m: round(v * 100, 4) for m, v in preds.items()},
         "recommended_model": cfg.get("selected_model"),
+        "data_source": "your pasted data" if custom else "live market data",
     }
+
+
+def parse_custom_csv(text, asset):
+    """Parse user-pasted CSV: date,open,high,low,close,volume (KSE100: date,close)."""
+    df = pd.read_csv(io.StringIO(text.strip()), sep=None, engine="python")
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    need = ["date", "close"] if asset == "KSE100" else ["date", "open", "high", "low", "close", "volume"]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV is missing column(s): {', '.join(missing)}. Needed: {', '.join(need)}")
+    df = df[need].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", format="mixed")
+    for c in need[1:]:
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False), errors="coerce")
+    df = df.dropna().drop_duplicates("date", keep="last").sort_values("date")
+    return df[df["close"] > 0].reset_index(drop=True)
 
 
 # ----------------------------------------------------------------------------
 # Routes
 # ----------------------------------------------------------------------------
-@app.route("/api/predict")
+@app.route("/api/predict", methods=["GET", "POST"])
 def api_predict():
-    asset = request.args.get("asset", "OGDC").upper()
-    model = request.args.get("model", "LSTM").upper()
+    body = request.get_json(silent=True) or {}
+    asset = str(body.get("asset") or request.args.get("asset", "OGDC")).strip().upper()
+    model = str(body.get("model") or request.args.get("model", "LSTM")).strip().upper()
+    csv_text = (body.get("csv") or "").strip()
     if asset not in ASSETS:
-        return jsonify(error=f"asset must be one of {ASSETS}"), 400
+        return jsonify(error=f"'{asset}' is not supported. Choose one of: {', '.join(ASSETS)}"), 400
     if model not in MODELS:
         return jsonify(error=f"model must be one of {MODELS}"), 400
     try:
-        return jsonify(predict(asset, model))
+        prices = parse_custom_csv(csv_text, asset) if csv_text else None
+        return jsonify(predict(asset, model, prices))
     except Exception as e:
-        return jsonify(error=str(e)), 500
+        return jsonify(error=str(e)), 400 if csv_text else 500
 
 
 @app.route("/")
@@ -387,10 +412,13 @@ main{max-width:560px;margin:0 auto;padding:24px 16px 48px}h1{font-size:1.4rem;ma
 .sub{color:var(--muted);margin:0 0 20px;font-size:.92rem}
 .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:16px}
 label{display:block;font-size:.8rem;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
-select{width:100%;padding:11px;font-size:1rem;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text)}
+input,select,textarea{width:100%;padding:11px;font-size:1rem;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text)}
 .models{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:16px}
 .models button{padding:11px 0;font-size:.95rem;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);cursor:pointer}
 .models button.active{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+textarea{margin-top:8px;font-family:monospace;font-size:.85rem}
+details{margin-top:16px}summary{cursor:pointer;color:var(--muted);font-size:.9rem}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.chips span{font-size:.8rem;padding:4px 10px;border:1px solid var(--border);border-radius:999px;cursor:pointer;color:var(--muted)}
 .go{width:100%;margin-top:16px;padding:13px;font-size:1rem;font-weight:600;border:0;border-radius:10px;background:var(--accent);color:#fff;cursor:pointer}
 .go:disabled{opacity:.6;cursor:wait}.big{font-size:2.2rem;font-weight:700;margin:4px 0}
 .up{color:var(--up)}.down{color:var(--down)}
@@ -400,15 +428,15 @@ select{width:100%;padding:11px;font-size:1rem;border-radius:10px;border:1px soli
 <h1>Pakistan Finance Predictor</h1>
 <p class="sub">Next-trading-day return forecast for PSX stocks and the KSE-100 using RNN, LSTM and GRU models.</p>
 <div class="card">
-<label for="asset">Stock / Index</label>
-<select id="asset">
-<option value="OGDC">OGDC - Oil &amp; Gas Development Co.</option>
-<option value="HBL">HBL - Habib Bank Ltd.</option>
-<option value="MEBL">MEBL - Meezan Bank Ltd.</option>
-<option value="ENGRO">ENGRO - Engro Corporation</option>
-<option value="KSE100">KSE-100 Index</option></select>
+<label for="asset">Type a stock symbol</label>
+<input id="asset" list="symbols" value="OGDC" placeholder="OGDC, HBL, MEBL, ENGRO or KSE100" autocomplete="off">
+<datalist id="symbols"><option value="OGDC"><option value="HBL"><option value="MEBL"><option value="ENGRO"><option value="KSE100"></datalist>
+<div class="chips" id="chips"><span>OGDC</span><span>HBL</span><span>MEBL</span><span>ENGRO</span><span>KSE100</span></div>
 <div class="models" id="models">
 <button data-model="RNN">RNN</button><button data-model="LSTM" class="active">LSTM</button><button data-model="GRU">GRU</button></div>
+<details><summary>Optional: paste your own price data (CSV)</summary>
+<textarea id="csv" rows="6" placeholder="date,open,high,low,close,volume&#10;2026-01-02,250.1,255.0,249.0,254.2,1200000&#10;... (about 130+ daily rows; KSE100 needs only date,close)"></textarea>
+<div class="note">Leave empty to use live market data.</div></details>
 <button class="go" id="go">Predict</button></div>
 <div class="card" id="result" hidden></div>
 <p class="note">Educational project, not financial advice. The first request after a pause can take a few seconds while models load.</p>
@@ -418,14 +446,16 @@ let model="LSTM";const $=i=>document.getElementById(i);
 document.querySelectorAll("#models button").forEach(b=>{b.onclick=()=>{
 document.querySelectorAll("#models button").forEach(x=>x.classList.remove("active"));
 b.classList.add("active");model=b.dataset.model}});
+document.querySelectorAll("#chips span").forEach(c=>c.onclick=()=>{$("asset").value=c.textContent});
 $("go").onclick=async()=>{const btn=$("go"),box=$("result");
 btn.disabled=true;btn.textContent="Predicting...";box.hidden=false;box.textContent="Loading...";
-try{const r=await fetch(`/api/predict?asset=${$("asset").value}&model=${model}`);const d=await r.json();
+try{const r=await fetch("/api/predict",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({asset:$("asset").value,model:model,csv:$("csv").value})});const d=await r.json();
 if(!r.ok)throw new Error(d.error||"Request failed");
 const up=d.direction==="UP",cls=up?"up":"down",sign=d.predicted_return_pct>0?"+":"";
 const others=Object.entries(d.all_models_pct).map(([m,v])=>`<div class="row"><span>${m}${m===d.recommended_model?" (best on validation)":""}</span><span>${v>0?"+":""}${v}%</span></div>`).join("");
 box.innerHTML=`<div class="muted">${d.asset} - ${d.model} model</div>
 <div class="big ${cls}">${up?"&#9650;":"&#9660;"} ${sign}${d.predicted_return_pct}%</div>
+<div class="row"><span class="muted">Source</span><span>${d.data_source}</span></div>
 <div class="row"><span class="muted">Data as of</span><span>${d.as_of_date}</span></div>
 <div class="row"><span class="muted">Last close</span><span>${d.last_close.toLocaleString()}</span></div>
 <div class="row"><span class="muted">Implied next close</span><span>${d.predicted_next_close.toLocaleString()}</span></div>
